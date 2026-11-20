@@ -106,10 +106,12 @@ class TestModels:
                                                 os.path.join("openwakeword", "resources", "models", "alexa_v0.1.onnx")
                                             ], inference_framework="onnx")
 
-        with mock.patch.dict(sys.modules, {'tflite_runtime': None}):
-            openwakeword.Model(wakeword_models=[
+        # Without the LiteRT runtime, the ONNX versions of tflite models are used, if available
+        with mock.patch.dict(sys.modules, {'ai_edge_litert': None, 'ai_edge_litert.interpreter': None}):
+            owwModel = openwakeword.Model(wakeword_models=[
                                             os.path.join("openwakeword", "resources", "models", "alexa_v0.1.tflite")
                                         ], inference_framework="tflite")
+            assert type(owwModel.models["alexa_v0.1"]).__name__ == "InferenceSession"
 
     def test_predict_with_custom_verifier_model(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
