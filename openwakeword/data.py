@@ -16,6 +16,7 @@
 from multiprocessing.pool import ThreadPool
 import os
 import re
+import subprocess
 import logging
 from functools import partial
 from pathlib import Path
@@ -225,12 +226,16 @@ def load_audio_clips(files, clip_size=32000):
 
 
 # Convert clips with sox
-def _convert_clip(input_file, output_file, backend="ffmpeg"):
+def _convert_clip(input_file, output_file, backend="ffmpeg", sr=16000):
+    # Arguments are passed as a list (not through a shell), so file names with quotes or spaces are safe
     if backend == "sox":
-        cmd = f"sox \"{input_file}\" -G -r 16000 -c 1 -b 16 \"{output_file}\""
+        cmd = ["sox", str(input_file), "-G", "-r", str(sr), "-c", "1", "-b", "16", str(output_file)]
     elif backend == "ffmpeg":
-        cmd = f"ffmpeg -y -i \"{input_file}\" -ar 16000 \"{output_file}\""
-    os.system(cmd)
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(input_file), "-ar", str(sr), "-ac", "1",
+               "-sample_fmt", "s16", str(output_file)]
+    else:
+        raise ValueError(f"Unknown backend '{backend}', must be 'ffmpeg' or 'sox'")
+    subprocess.run(cmd, check=False)
     return None
 
 
@@ -254,10 +259,12 @@ def convert_clips(input_files, output_files, sr=16000, ncpu=1, backend="ffmpeg")
     pool = ThreadPool(processes=ncpu)
 
     # Set backend for conversion
-    f = partial(_convert_clip, backend=backend)
+    f = partial(_convert_clip, backend=backend, sr=sr)
 
     # Submit jobs
     pool.starmap(f, [(i, j) for i, j in zip(input_files, output_files)])
+    pool.close()
+    pool.join()
 
 
 def filter_audio_paths(target_dirs, min_length_secs, max_length_secs, duration_method="size", glob_filter=None):
@@ -816,9 +823,9 @@ def create_fixed_size_clip(x, n_samples, sr=16000, start=None, end_jitter=.200):
 
     if len(x) > n_samples:
         if np.random.random() >= 0.5:
-            dat = x[0:n_samples].numpy()
+            dat = np.asarray(x[0:n_samples])
         else:
-            dat = x[-n_samples:].numpy()
+            dat = np.asarray(x[-n_samples:])
     else:
         dat[start:start+len(x)] = x
 
@@ -962,16 +969,14 @@ def trim_mmap(mmap_path):
     """
     # Identify the last full row in the mmaped file
     mmap_file1 = np.load(mmap_path, mmap_mode='r')
-    i = -1
-    while np.all(mmap_file1[i, :, :] == 0):
-        i -= 1
-
-    N_new = mmap_file1.shape[0] + i + 1
+    N_new = mmap_file1.shape[0]
+    while N_new > 0 and np.all(mmap_file1[N_new - 1] == 0):
+        N_new -= 1
 
     # Create new mmap_file and copy over data in batches
-    output_file2 = mmap_path.strip(".npy") + "2.npy"
-    mmap_file2 = open_memmap(output_file2, mode='w+', dtype=np.float32,
-                             shape=(N_new, mmap_file1.shape[1], mmap_file1.shape[2]))
+    output_file2 = os.path.splitext(str(mmap_path))[0] + ".trimmed.npy"
+    mmap_file2 = open_memmap(output_file2, mode='w+', dtype=mmap_file1.dtype,
+                             shape=(N_new,) + mmap_file1.shape[1:])
 
     for i in tqdm(range(0, mmap_file1.shape[0], 1024), total=mmap_file1.shape[0]//1024, desc="Trimming empty rows"):
         if i + 1024 > N_new:
@@ -981,11 +986,10 @@ def trim_mmap(mmap_path):
             mmap_file2[i:i+1024] = mmap_file1[i:i+1024].copy()
             mmap_file2.flush()
 
-    # Remove old mmaped file
-    os.remove(mmap_path)
-
-    # Rename new mmap file to match original
-    os.rename(output_file2, mmap_path)
+    # Replace the original file with the trimmed version (closing the memory maps first, which is required on Windows)
+    mmap_file2.flush()
+    del mmap_file1, mmap_file2
+    os.replace(output_file2, mmap_path)
 
 
 # Generate words that sound similar ("adversarial") to the input phrase using phoneme overlap

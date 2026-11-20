@@ -156,3 +156,31 @@ def test_compute_features_is_atomic(tmp_path):
     with pytest.raises(RuntimeError):
         compute_features_from_generator(failing_generator(), n_total=12, clip_duration=32000, output_file=output)
     assert not os.path.exists(output)
+
+
+@pytest.mark.parametrize("name", ["features.npy", "happy.npy"])
+def test_trim_mmap(tmp_path, monkeypatch, name):
+    from numpy.lib.format import open_memmap
+    monkeypatch.chdir(tmp_path)
+    path = os.path.join(".", name)  # relative path, which was previously mangled by str.strip(".npy")
+    arr = open_memmap(path, mode="w+", dtype=np.float32, shape=(10, 4, 3))
+    arr[:7] = 1.0
+    arr.flush()
+    del arr
+    data.trim_mmap(path)
+    assert np.load(path).shape == (7, 4, 3)
+    assert sorted(os.listdir(tmp_path)) == [name]
+
+
+def test_trim_mmap_all_empty(tmp_path):
+    path = str(tmp_path / "empty.npy")
+    np.save(path, np.zeros((5, 2, 2), dtype=np.float32))
+    data.trim_mmap(path)
+    assert np.load(path).shape == (0, 2, 2)
+
+
+def test_create_fixed_size_clip():
+    x = np.ones(1000)
+    assert data.create_fixed_size_clip(x, 4000).shape == (4000,)
+    assert data.create_fixed_size_clip(x, 500).shape == (500,)
+    assert data.create_fixed_size_clip(torch.ones(1000), 500).shape == (500,)
