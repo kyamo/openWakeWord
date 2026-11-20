@@ -1,4 +1,4 @@
-![Github CI](https://github.com/dscripka/openWakeWord/actions/workflows/tests.yml/badge.svg)
+![Github CI](https://github.com/kyamo/openWakeWord/actions/workflows/tests.yml/badge.svg)
 
 # openWakeWord
 
