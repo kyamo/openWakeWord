@@ -358,3 +358,13 @@ def test_predict_clip_rejects_wrong_format(tmp_path):
     owwModel = openwakeword.Model(wakeword_models=["alexa"], inference_framework="onnx")
     with pytest.raises(ValueError):
         owwModel.predict_clip(path)
+
+
+def test_reset_clears_vad_state():
+    owwModel = openwakeword.Model(wakeword_models=["alexa"], inference_framework="onnx", vad_threshold=0.5)
+    for _ in range(5):
+        owwModel.predict(np.random.randint(-1000, 1000, 1280).astype(np.int16))
+    assert len(owwModel.vad.prediction_buffer) > 0
+    owwModel.reset()
+    assert len(owwModel.vad.prediction_buffer) == 0
+    assert not owwModel.vad._h.any() and not owwModel.vad._c.any()

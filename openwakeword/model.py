@@ -234,6 +234,12 @@ class Model():
         when called too frequently."""
         self.prediction_buffer = defaultdict(partial(deque, maxlen=30))
         self.preprocessor.reset()
+        if self.vad_threshold > 0:
+            self.vad.reset_states()
+            self.vad.prediction_buffer.clear()
+        if self.speex_ns is not None:
+            from speexdsp_ns import NoiseSuppression
+            self.speex_ns = NoiseSuppression.create(160, 16000)
 
     def predict(self, x: np.ndarray, patience: Optional[dict] = None,
                 threshold: Optional[dict] = None, debounce_time: float = 0.0, timing: bool = False):
