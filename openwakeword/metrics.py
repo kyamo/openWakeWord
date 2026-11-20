@@ -95,8 +95,9 @@ def generate_roc_curve_tprs(
         list: A list of true positive rates at different score threshold levels
     """
 
+    score_array = np.asarray(scores)
     tprs = []
     for threshold in tqdm(np.linspace(0.01, 0.99, num=n_points)):
-        tprs.append(sum(scores >= threshold)/len(scores))
+        tprs.append(float(np.sum(score_array >= threshold))/len(score_array))
 
     return tprs
