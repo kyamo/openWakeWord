@@ -62,10 +62,15 @@ def get_reference_clip_features(
     # Get predictions
     for _ in range(N):
         # Load clip
-        if isinstance(reference_clip, str):
+        if isinstance(reference_clip, (str, os.PathLike)):
             sr, dat = scipy.io.wavfile.read(reference_clip)
+            if sr != 16000 or dat.ndim != 1 or dat.dtype != np.int16:
+                raise ValueError(f"'{reference_clip}' must be a 16-bit PCM, 16 khz, single-channel WAV file")
         else:
             dat = reference_clip
+
+        # Start each pass with empty buffers, so that clips don't influence each other
+        oww_model.reset()
 
         # Set random starting point to get small variations in features
         if N != 1:
@@ -139,14 +144,12 @@ def train_custom_verifier(
         None
     """
     # Load target openWakeWord model
-    if os.path.exists(model_name):
-        oww = openwakeword.Model(
-            wakeword_models=[model_name],
-            **kwargs
-        )
-        model_name = os.path.splitext(model_name)[0].split(os.path.sep)[-1]
-    else:
-        oww = openwakeword.Model(**kwargs)
+    # (pre-trained models can be referenced by name, e.g. "alexa" or "hey_mycroft")
+    oww = openwakeword.Model(
+        wakeword_models=[str(model_name)],
+        **kwargs
+    )
+    model_name = list(oww.models.keys())[0]
 
     # Get features from positive reference clips
     positive_features = np.vstack(

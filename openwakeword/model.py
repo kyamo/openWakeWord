@@ -82,6 +82,8 @@ class Model():
         """
         # Get model paths for pre-trained models if user doesn't provide models to load
         pretrained_model_paths = openwakeword.get_pretrained_model_paths(inference_framework)
+        wakeword_models = [str(i) for i in wakeword_models]  # copy, so that the caller's list isn't modified
+        custom_verifier_models = dict(custom_verifier_models)
         wakeword_model_names = []
         if wakeword_models == []:
             wakeword_models = pretrained_model_paths
