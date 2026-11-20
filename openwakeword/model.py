@@ -25,7 +25,7 @@ import pickle
 from collections import deque, defaultdict
 from functools import partial
 import time
-from typing import List, Union, DefaultDict, Dict
+from typing import Any, List, Optional, Union, DefaultDict, Dict
 
 
 # Define main model class
@@ -229,8 +229,8 @@ class Model():
         self.prediction_buffer = defaultdict(partial(deque, maxlen=30))
         self.preprocessor.reset()
 
-    def predict(self, x: np.ndarray, patience: dict = {},
-                threshold: dict = {}, debounce_time: float = 0.0, timing: bool = False):
+    def predict(self, x: np.ndarray, patience: Optional[dict] = None,
+                threshold: Optional[dict] = None, debounce_time: float = 0.0, timing: bool = False):
         """Predict with all of the wakeword models on the input audio frames
 
         Args:
@@ -258,6 +258,9 @@ class Model():
                   wake-word/wake-phrase detected. If the `timing` argument is true, returns a
                   tuple of dicts containing model predictions and timing information, respectively.
         """
+        patience = patience or {}
+        threshold = threshold or {}
+
         # Check input data type
         if not isinstance(x, np.ndarray):
             raise ValueError(f"The input audio data (x) must by a Numpy array, instead received an object of type {type(x)}.")
@@ -282,6 +285,8 @@ class Model():
         for mdl in self.models.keys():
             if timing:
                 model_start = time.time()
+
+            prediction: Any
 
             # Run model to get predictions
             if n_prepared_samples > 1280:
@@ -311,14 +316,18 @@ class Model():
                     prediction = [[[0]*(n_classes+1)]]
 
             if self.model_outputs[mdl] == 1:
+                model_labels = [mdl]
                 predictions[mdl] = prediction[0][0][0]
             else:
+                model_labels = []
                 for int_label, cls in self.class_mapping[mdl].items():
+                    model_labels.append(cls)
                     predictions[cls] = prediction[0][0][int(int_label)]
 
-            # Update scores based on custom verifier model
+            # Update scores based on custom verifier model (only for the labels of the current model,
+            # so that a verifier is never applied twice or with the features of a different model)
             if self.custom_verifier_models != {}:
-                for cls in predictions.keys():
+                for cls in model_labels:
                     if predictions[cls] >= self.custom_verifier_threshold:
                         parent_model = self.get_parent_model_from_label(cls)
                         if self.custom_verifier_models.get(parent_model, False):
