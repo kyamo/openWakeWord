@@ -19,8 +19,7 @@ import pathlib
 from collections import deque
 from itertools import islice
 from multiprocessing.pool import ThreadPool
-from multiprocessing import Process, Queue
-import time
+from multiprocessing import Pool
 import logging
 from tqdm import tqdm
 import openwakeword
@@ -161,6 +160,10 @@ class AudioFeatures():
 
             self.embedding_model_predict = tflite_embedding_predict
 
+        self.inference_framework = inference_framework
+        if inference_framework == "tflite":
+            self.onnx_execution_provider = "CPUExecutionProvider"  # batched feature computation runs on the CPU
+
         # Create databuffers with empty/random data
         self.raw_data_buffer: Deque = deque(maxlen=sr*10)
         self.melspectrogram_buffer = np.ones((76, 32))  # n_frames x num_features
@@ -263,8 +266,9 @@ class AudioFeatures():
         """
 
         # Prepare ThreadPool object, if needed for multithreading
+        # (tflite interpreters can't be used from several threads at once)
         pool = None
-        if "CPU" in self.onnx_execution_provider:
+        if "CPU" in self.onnx_execution_provider and self.inference_framework == "onnx" and ncpu > 1:
             pool = ThreadPool(processes=ncpu)
 
         # Make batches
@@ -281,12 +285,15 @@ class AudioFeatures():
                 chunksize = batch.shape[0]//ncpu if batch.shape[0] >= ncpu else 1
                 result = np.array(pool.map(self._get_melspectrogram,
                                            batch, chunksize=chunksize))
+            else:
+                result = np.array([self._get_melspectrogram(j) for j in batch])
 
             melspecs[i:i+batch_size, :, :] = result.squeeze()
 
         # Cleanup ThreadPool
         if pool:
             pool.close()
+            pool.join()
 
         return melspecs
 
@@ -315,8 +322,9 @@ class AudioFeatures():
             raise ValueError("Embedding model requires the input melspectrograms to have at least 76 frames")
 
         # Prepare ThreadPool object, if needed for multithreading
+        # (tflite interpreters can't be used from several threads at once)
         pool = None
-        if "CPU" in self.onnx_execution_provider:
+        if "CPU" in self.onnx_execution_provider and self.inference_framework == "onnx" and ncpu > 1:
             pool = ThreadPool(processes=ncpu)
 
         # Calculate array sizes and make batches
@@ -343,6 +351,8 @@ class AudioFeatures():
                     chunksize = batch.shape[0]//ncpu if batch.shape[0] >= ncpu else 1
                     result = np.array(pool.map(self._get_embeddings_from_melspec,
                                       batch, chunksize=chunksize))
+                else:
+                    result = np.array([self._get_embeddings_from_melspec(j) for j in batch])
 
                 for j, ndx2 in zip(range(0, result.shape[0], n_frames), ndcs):
                     embeddings[ndx2, :, :] = result[j:j+n_frames]
@@ -353,6 +363,7 @@ class AudioFeatures():
         # Cleanup ThreadPool
         if pool:
             pool.close()
+            pool.join()
 
         return embeddings
 
@@ -497,51 +508,35 @@ def bulk_predict(
         dict: A dictionary containing the predictions for each file, with the filepath as the key
     """
 
-    # Create openWakeWord model objects
-    n_batches = max(1, len(file_paths)//ncpu)
-    remainder = len(file_paths) % ncpu
-    chunks = [file_paths[i:i+n_batches] for i in range(0, max(1, len(file_paths)-remainder), n_batches)]
-    for i in range(1, remainder+1):
-        chunks[i-1].append(file_paths[-1*i])
+    model_kwargs = {key: value for key, value in kwargs.items()
+                    if key in openwakeword.Model.__init__.__code__.co_varnames}
+    prediction_kwargs = {key: value for key, value in kwargs.items()
+                         if key in getattr(openwakeword.Model, prediction_function).__code__.co_varnames}
 
-    # Create jobs
-    ps = []
-    mdls = []
-    q: Queue = Queue()
-    for chunk in chunks:
-        filtered_kwargs = {key: value for key, value in kwargs.items()
-                           if key in openwakeword.Model.__init__.__code__.co_varnames}
-        oww = openwakeword.Model(
-            wakeword_models=wakeword_models,
-            inference_framework=inference_framework,
-            **filtered_kwargs
-        )
-        mdls.append(oww)
+    # Each worker process creates its own model. A process pool with module-level functions works with
+    # every multiprocessing start method ("fork", "forkserver" (default on Linux since Python 3.14) and "spawn").
+    ncpu = max(1, min(ncpu, len(file_paths)))
+    with Pool(processes=ncpu, initializer=_bulk_predict_init,
+              initargs=(wakeword_models, inference_framework, model_kwargs)) as pool:
+        results = pool.map(_bulk_predict_worker, [(i, prediction_function, prediction_kwargs) for i in file_paths])
 
-        def f(clips):
-            results = []
-            for clip in clips:
-                func = getattr(mdls[-1], prediction_function)
-                filtered_kwargs = {key: value for key, value in kwargs.items()
-                                   if key in func.__code__.co_varnames}
-                results.append({clip: func(clip, **filtered_kwargs)})
-            q.put(results)
+    return dict(results)
 
-        ps.append(Process(target=f, args=(chunk,)))
 
-    # Submit jobs
-    for p in ps:
-        p.start()
+_bulk_predict_model = None
 
-    # Collection results
-    results = []
-    for p in ps:
-        while q.empty():
-            time.sleep(0.01)
-        results.extend(q.get())
 
-    # Consolidate results and return
-    return {list(i.keys())[0]: list(i.values())[0] for i in results}
+def _bulk_predict_init(wakeword_models, inference_framework, model_kwargs):
+    global _bulk_predict_model
+    _bulk_predict_model = openwakeword.Model(wakeword_models=wakeword_models, inference_framework=inference_framework,
+                                             **model_kwargs)
+
+
+def _bulk_predict_worker(args):
+    clip, prediction_function, prediction_kwargs = args
+    result = getattr(_bulk_predict_model, prediction_function)(clip, **prediction_kwargs)
+    _bulk_predict_model.reset()  # type: ignore[attr-defined]  # independent results for each clip
+    return clip, result
 
 
 def compute_features_from_generator(generator, n_total, clip_duration, output_file, device="cpu", ncpu=1):
