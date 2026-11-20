@@ -100,12 +100,6 @@ def test_augment_clips(tmp_path):
     assert all(b.dtype == np.int16 for b in batches)
 
 
-def test_augment_clips_wrong_sample_rate(tmp_path):
-    clip = _write_wav(tmp_path / "clip.wav", np.zeros(8000), sr=8000)
-    with pytest.raises(ValueError):
-        list(data.augment_clips([clip], total_length=32000, batch_size=1))
-
-
 def test_mix_clips_batch(tmp_path):
     fg = [_write_wav(tmp_path / f"fg{i}.wav", 0.3*np.random.randn(8000)) for i in range(4)]
     bg = [_write_wav(tmp_path / f"bg{i}.wav", 0.1*np.random.randn(n)) for i, n in enumerate([16000, 32000, 50000])]
@@ -136,7 +130,8 @@ def test_generate_adversarial_texts_without_phonemizer(monkeypatch):
 
 
 def test_compute_features_is_atomic(tmp_path):
-    from openwakeword.utils import compute_features_from_generator
+    from openwakeword.utils import compute_features_from_generator, download_models
+    download_models(model_names=["alexa"])  # the feature models are always downloaded
 
     def generator():
         for _ in range(3):
@@ -184,3 +179,25 @@ def test_create_fixed_size_clip():
     assert data.create_fixed_size_clip(x, 4000).shape == (4000,)
     assert data.create_fixed_size_clip(x, 500).shape == (500,)
     assert data.create_fixed_size_clip(torch.ones(1000), 500).shape == (500,)
+
+
+def test_resample_wav_files(tmp_path):
+    t = np.arange(22050)/22050
+    path = _write_wav(tmp_path / "a.wav", 0.5*np.sin(2*np.pi*440*t), sr=22050)
+    stereo = str(tmp_path / "b.wav")
+    sf.write(stereo, np.zeros((16000, 2), dtype=np.float32), 16000, subtype="PCM_16")
+    ok = _write_wav(tmp_path / "c.wav", np.zeros(16000))
+    assert data.resample_wav_files([path, stereo, ok]) == 2
+    for p in (path, stereo, ok):
+        info = sf.info(p)
+        assert (info.samplerate, info.channels, info.subtype) == (16000, 1, "PCM_16")
+    assert sf.info(path).frames == 16000
+
+
+def test_augment_clips_resamples(tmp_path):
+    clip = _write_wav(tmp_path / "clip.wav", 0.5*np.sin(2*np.pi*300*np.arange(22050)/22050), sr=22050)
+    probabilities = {k: 0.0 for k in ["SevenBandParametricEQ", "TanhDistortion", "PitchShift", "BandStopFilter",
+                                      "AddColoredNoise", "AddBackgroundNoise", "Gain", "RIR"]}
+    batch = next(data.augment_clips([clip], total_length=32000, batch_size=1, augmentation_probabilities=probabilities))
+    assert batch.shape == (1, 32000)
+    assert np.count_nonzero(batch) == pytest.approx(16000, abs=300)  # 1 s of audio at 16 khz

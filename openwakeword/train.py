@@ -9,15 +9,15 @@ import sys
 import tempfile
 import uuid
 import numpy as np
-import scipy
 import collections
 import argparse
 import logging
 from tqdm import tqdm
 import yaml
+import soundfile
 from pathlib import Path
 import openwakeword
-from openwakeword.data import generate_adversarial_texts, augment_clips, mmap_batch_generator
+from openwakeword.data import generate_adversarial_texts, augment_clips, mmap_batch_generator, resample_wav_files
 from openwakeword.utils import compute_features_from_generator
 from openwakeword.utils import AudioFeatures
 
@@ -685,8 +685,23 @@ def load_sample_generator(config):
                                  "piper-sample-generator model (.pt) or a Piper voice (.onnx)")
             model = str(candidates[0])
     except ImportError:
-        from generate_samples import generate_samples as _generate  # dscripka/piper-sample-generator
+        from generate_samples import generate_samples as _legacy_generate  # dscripka/piper-sample-generator
         _generate_onnx = None
+
+        def _generate(**kwargs):
+            # The fork loads its pickled generator checkpoint with torch.load, which defaults to
+            # weights_only=True since torch 2.6; restore the previous default for this call only
+            original_torch_load = torch.load
+
+            def _torch_load(*args, **load_kwargs):
+                load_kwargs.setdefault("weights_only", False)
+                return original_torch_load(*args, **load_kwargs)
+
+            torch.load = _torch_load  # type: ignore[assignment]
+            try:
+                return _legacy_generate(**kwargs)
+            finally:
+                torch.load = original_torch_load
 
     def generate_samples(**kwargs):
         if model is not None:
@@ -696,8 +711,17 @@ def load_sample_generator(config):
                 raise ValueError("Piper voices (.onnx) require the current rhasspy/piper-sample-generator")
             kwargs.pop("batch_size", None)
             kwargs.pop("auto_reduce_batch_size", None)
-            return _generate_onnx(**kwargs)
-        return _generate(**kwargs)
+            result = _generate_onnx(**kwargs)
+        else:
+            result = _generate(**kwargs)
+
+        # Most Piper voices (and the current piper-sample-generator models) produce 22.05 khz audio,
+        # while openWakeWord requires 16 khz
+        if kwargs.get("output_dir"):
+            n_converted = resample_wav_files([str(i) for i in Path(kwargs["output_dir"]).glob("*.wav")], 16000)
+            if n_converted:
+                logging.info(f"Converted {n_converted} generated clips to 16 khz")
+        return result
 
     return generate_samples
 
@@ -861,8 +885,8 @@ if __name__ == '__main__':
     positive_clips = [str(i) for i in Path(positive_test_output_dir).glob("*.wav")]
     duration_in_samples = []
     for i in range(n):
-        sr, dat = scipy.io.wavfile.read(positive_clips[np.random.randint(0, len(positive_clips))])
-        duration_in_samples.append(len(dat))
+        clip_info = soundfile.info(positive_clips[np.random.randint(0, len(positive_clips))])
+        duration_in_samples.append(clip_info.frames*16000/clip_info.samplerate)
 
     config["total_length"] = int(round(np.median(duration_in_samples)/1000)*1000) + 12000  # add 750 ms to clip duration as buffer
     if config["total_length"] < 32000:

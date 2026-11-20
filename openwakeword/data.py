@@ -54,6 +54,34 @@ def load_audio(path: str) -> Tuple[torch.Tensor, int]:
     return torch.from_numpy(np.ascontiguousarray(data.T)), sr
 
 
+def resample_audio(x: np.ndarray, orig_sr: int, target_sr: int = 16000) -> np.ndarray:
+    """Resamples audio (along the last axis) with a polyphase filter"""
+    if orig_sr == target_sr:
+        return x
+    import scipy.signal
+    from math import gcd
+    g = gcd(int(orig_sr), int(target_sr))
+    return scipy.signal.resample_poly(x, int(target_sr)//g, int(orig_sr)//g, axis=-1).astype(x.dtype)
+
+
+def resample_wav_files(paths: List[str], target_sr: int = 16000) -> int:
+    """Converts WAV files in place to single-channel 16-bit PCM audio at `target_sr`, if needed.
+
+    Returns:
+        int: The number of converted files
+    """
+    n_converted = 0
+    for path in paths:
+        info = soundfile.info(str(path))
+        if info.samplerate == target_sr and info.channels == 1 and info.subtype == "PCM_16":
+            continue
+        audio, sr = soundfile.read(str(path), dtype="float32", always_2d=True)
+        audio = resample_audio(audio.mean(axis=1), sr, target_sr)
+        soundfile.write(str(path), np.clip(audio, -1, 1), target_sr, subtype="PCM_16")
+        n_converted += 1
+    return n_converted
+
+
 def load_rir(path: str) -> torch.Tensor:
     """Loads a room impulse response file, selecting a random channel for multi-channel files."""
     rir, _ = load_audio(path)
@@ -699,7 +727,7 @@ def augment_clips(
         total_length (int): The total length of audio files (in samples) after augmentation. All input clips
                             will be left-padded with silence to reach this size, with between 0 and 200 ms
                             of other audio after the end of the original input clip.
-        sr (int): The sample size of the input audio files
+        sr (int): The sample rate of the output audio (input clips with other sample rates are resampled)
         batch_size (int): The number of audio files to augment at once.
         augmentation_probabilities (dict): The individual probabilities of each augmentation. If all probabilities
                                            are zero, the input audio files will simply be padded with silence. THe
@@ -772,11 +800,12 @@ def augment_clips(
         for clip in batch:
             clip_tensor, clip_sr = load_audio(clip)
             clip_data = clip_tensor[0].numpy()
+            if clip_sr != sr:
+                clip_data = resample_audio(clip_data, clip_sr, sr)
+                clip_sr = sr
+
             if clip_data.shape[0] > total_length:
                 clip_data = clip_data[0:total_length]
-
-            if clip_sr != sr:
-                raise ValueError(f"Error! Clip {clip} has a sample rate of {clip_sr} hz instead of {sr} hz!")
 
             clip_data = create_fixed_size_clip(clip_data, total_length, clip_sr).astype(np.float32)
 
