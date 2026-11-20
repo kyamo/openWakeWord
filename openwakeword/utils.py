@@ -573,6 +573,12 @@ def compute_features_from_generator(generator, n_total, clip_duration, output_fi
     # Determine the output shape and create output file
     n_feature_cols = F.get_embedding_shape(clip_duration/16000)
     output_shape = (n_total, n_feature_cols[0], n_feature_cols[1])
+
+    # Write to a temporary file first, so that an interrupted run never leaves a partial
+    # (but valid-looking) feature file behind
+    final_output_file = output_file
+    output_file = str(output_file)[:-4] + ".incomplete.npy" if str(output_file).endswith(".npy") \
+        else str(output_file) + ".incomplete.npy"
     fp = open_memmap(output_file, mode='w+', dtype=np.float32, shape=output_shape)
 
     # Get batch size by pulling one value from the generator and store features
@@ -602,8 +608,10 @@ def compute_features_from_generator(generator, n_total, clip_duration, output_fi
         row_counter += features.shape[0]
         fp.flush()
 
-    # Trip empty rows from the mmapped array
+    # Trim empty rows from the mmapped array and move it to the final location
+    del fp
     trim_mmap(output_file)
+    os.replace(output_file, final_output_file)
 
 
 # Function to download files from a URL with a progress bar

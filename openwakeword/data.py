@@ -29,11 +29,121 @@ import torch
 import audiomentations
 import torch_audiomentations
 from numpy.lib.format import open_memmap
-from speechbrain.dataio.dataio import read_audio
-from speechbrain.processing.signal_processing import reverberate
-import torchaudio
+import soundfile
 import mutagen
-import acoustics
+
+
+# Audio I/O and signal processing helpers
+#
+# These replace functionality that was previously imported from speechbrain (`read_audio`, `reverberate`),
+# torchaudio (`info`, `load`, both removed or moved to torchcodec in torchaudio>=2.9) and acoustics
+# (`generator.noise`, unmaintained and incompatible with current scipy releases).
+
+def read_audio(path: str) -> torch.Tensor:
+    """Reads an audio file as a float32 tensor in [-1, 1]. Single channel files are returned
+    with shape (samples,), multi-channel files with shape (samples, channels)."""
+    data, _ = soundfile.read(str(path), dtype="float32")
+    return torch.from_numpy(data)
+
+
+def load_audio(path: str) -> Tuple[torch.Tensor, int]:
+    """Loads an audio file like the legacy `torchaudio.load`: a float32 tensor of shape
+    (channels, samples) and the sample rate."""
+    data, sr = soundfile.read(str(path), dtype="float32", always_2d=True)
+    return torch.from_numpy(np.ascontiguousarray(data.T)), sr
+
+
+def load_rir(path: str) -> torch.Tensor:
+    """Loads a room impulse response file, selecting a random channel for multi-channel files."""
+    rir, _ = load_audio(path)
+    return rir[random.randint(0, rir.shape[0] - 1)]
+
+
+def reverberate(waveforms: torch.Tensor, rir_waveform: torch.Tensor, rescale_amp: str = "avg") -> torch.Tensor:
+    """Convolves a batch of waveforms with a room impulse response.
+
+    The output is aligned to the direct path (the peak of the impulse response) and rescaled
+    to the average (`rescale_amp="avg"`) or peak (`rescale_amp="peak"`) amplitude of the input,
+    mirroring `speechbrain.processing.signal_processing.reverberate`. Unlike the speechbrain version, a linear
+    (instead of circular) convolution is used, so the reverb tail does not wrap around to the start of the clip.
+
+    Args:
+        waveforms (torch.Tensor): Audio of shape (samples,) or (batch, samples)
+        rir_waveform (torch.Tensor): Impulse response of shape (samples,) or (1, samples)
+        rescale_amp (str): Either "avg" or "peak"
+
+    Returns:
+        torch.Tensor: The reverberated audio with the same shape as `waveforms`
+    """
+    squeeze = waveforms.ndim == 1
+    x = waveforms[None, :] if squeeze else waveforms
+    x = x.to(torch.float32)
+    rir = rir_waveform.reshape(-1).to(device=x.device, dtype=torch.float32)
+
+    def amplitude(a):
+        if rescale_amp == "peak":
+            return a.abs().max(dim=1, keepdim=True)[0]
+        return a.abs().mean(dim=1, keepdim=True)
+
+    orig_amp = amplitude(x)
+    direct_index = int(rir.abs().argmax())
+    n = x.shape[1]
+    n_fft = n + rir.shape[0] - 1
+    y = torch.fft.irfft(torch.fft.rfft(x, n=n_fft) * torch.fft.rfft(rir, n=n_fft), n=n_fft)
+    y = y[:, direct_index:direct_index + n]
+    y = y * (orig_amp / amplitude(y).clamp(min=1e-14))
+    return y[0] if squeeze else y
+
+
+def generate_colored_noise(n_samples: int, color: str = "white") -> np.ndarray:
+    """Generates noise with a power spectral density of 1/f^beta, normalized to a peak amplitude of 1.
+
+    Args:
+        n_samples (int): The number of samples to generate
+        color (str): One of "white" (beta=0), "pink" (1), "brown" (2), "blue" (-1), or "violet" (-2)
+
+    Returns:
+        ndarray: The generated noise
+    """
+    betas = {"white": 0, "pink": 1, "brown": 2, "blue": -1, "violet": -2}
+    if color not in betas:
+        raise ValueError(f"Unknown noise color '{color}', must be one of {list(betas.keys())}")
+    spectrum = np.fft.rfft(np.random.randn(n_samples))
+    freqs = np.fft.rfftfreq(n_samples)
+    freqs[0] = freqs[1] if n_samples > 1 else 1.0
+    spectrum *= freqs**(-betas[color]/2)
+    noise = np.fft.irfft(spectrum, n=n_samples)
+    return noise/max(np.abs(noise).max(), 1e-12)
+
+
+class AddBackgroundNoise:
+    """Mixes a random segment of a random background clip into each example of a batch at a random SNR.
+    Replaces `torch_audiomentations.AddBackgroundNoise`, which relies on `torchaudio.info`
+    (removed in torchaudio>=2.9)."""
+    def __init__(self, background_paths: List[str], min_snr_in_db: float = 3.0, max_snr_in_db: float = 30.0,
+                 p: float = 0.5):
+        self.background_paths = list(background_paths)
+        self.min_snr_in_db = min_snr_in_db
+        self.max_snr_in_db = max_snr_in_db
+        self.p = p
+
+    def _background(self, n_samples: int) -> torch.Tensor:
+        bg, _ = load_audio(random.choice(self.background_paths))
+        bg = bg[0]
+        if bg.shape[0] < n_samples:
+            bg = bg.repeat(int(np.ceil(n_samples/max(bg.shape[0], 1))))
+        start = random.randint(0, bg.shape[0] - n_samples)
+        return bg[start:start + n_samples]
+
+    def __call__(self, samples: torch.Tensor) -> torch.Tensor:
+        """Args: samples (torch.Tensor): audio of shape (batch, samples)"""
+        if not self.background_paths or random.random() >= self.p:
+            return samples
+        bg = torch.vstack([self._background(samples.shape[1]) for _ in range(samples.shape[0])]).to(samples.device)
+        snr = torch.empty(samples.shape[0], 1, device=samples.device).uniform_(self.min_snr_in_db, self.max_snr_in_db)
+        rms = lambda a: a.pow(2).mean(dim=1, keepdim=True).sqrt()  # noqa: E731
+        scale = rms(samples) / (rms(bg).clamp(min=1e-9) * 10**(snr/20))
+        return samples + scale*bg
 
 
 # Load audio clips and structure into clips of the same length
@@ -216,9 +326,6 @@ def estimate_clip_duration(audio_files: list, sizes: list):
         list: A list of durations (in seconds) for the audio files
     """
 
-    # Determine file type by checking the first file
-    details = torchaudio.info(audio_files[0])
-
     # Caculate any correction factors needed from the first file
     details = mutagen.File(audio_files[0])
     correction = 8*os.path.getsize(audio_files[0]) - details.info.bitrate*details.info.length
@@ -250,16 +357,17 @@ def estimate_mp3_duration(fpath):
 
     duration_seconds = 0
     try:
-        md = torchaudio.info(fpath)
-    except RuntimeError:
+        md = mutagen.File(fpath)
+        sample_rate, num_channels = md.info.sample_rate, md.info.channels
+    except Exception:
         return duration_seconds
 
     nbytes = os.path.getsize(fpath)
-    if md.num_channels == 1:
-        if md.sample_rate == 16000:
+    if num_channels == 1:
+        if sample_rate == 16000:
             duration_seconds = nbytes*conversion_factors["16_khz_single_channel"]
-    elif md.num_channels == 2:
-        if md.sample_rate == 16000:
+    elif num_channels == 2:
+        if sample_rate == 16000:
             duration_seconds = nbytes*conversion_factors["16_khz_stereo"]
 
     return duration_seconds
@@ -268,11 +376,11 @@ def estimate_mp3_duration(fpath):
 def get_clip_duration(clip):
     """Gets the duration of an audio clip in seconds from file header information"""
     try:
-        metadata = torchaudio.info(clip)
-    except RuntimeError:  # skip cases where file metadata can't be read
+        metadata = soundfile.info(str(clip))
+    except (RuntimeError, soundfile.LibsndfileError):  # skip cases where file metadata can't be read
         return 0
 
-    return metadata.num_frames/metadata.sample_rate
+    return metadata.frames/metadata.samplerate
 
 
 def get_wav_duration_from_filesize(size, nbytes=2):
@@ -413,7 +521,7 @@ def mix_clips_batch(
                 )
                 background_clips_batch[ndx] = repeated[0:combined_size]
                 background_clips_batch_delayed.append(repeated[0+delay:combined_size + delay].clone())
-            elif background_clip.shape[0] > (combined_size + delay):
+            else:
                 r = np.random.randint(0, max(1, background_clip.shape[0] - combined_size - delay))
                 background_clips_batch[ndx] = background_clip[r:r + combined_size]
                 background_clips_batch_delayed.append(background_clip[r+delay:r + combined_size + delay].clone())
@@ -431,8 +539,9 @@ def mix_clips_batch(
 
             if np.random.random() < generated_noise_augmentation:
                 noise_color = ["white", "pink", "blue", "brown", "violet"]
-                noise_clip = acoustics.generator.noise(combined_size, color=np.random.choice(noise_color))
-                noise_clip = torch.from_numpy(noise_clip/noise_clip.max())
+                noise_clip = torch.from_numpy(
+                    generate_colored_noise(combined_size, color=np.random.choice(noise_color))
+                ).to(mixed_clip.dtype)
                 mixed_clip = mix_clip(mixed_clip, noise_clip, np.random.choice(snrs_db), 0)
 
             mixed_clips.append(mixed_clip)
@@ -443,10 +552,7 @@ def mix_clips_batch(
         # Apply reverberation to the batch (from a single RIR file)
         if rirs:
             if np.random.random() <= rir_probability:
-                rir_waveform, sr = torchaudio.load(random.choice(rirs))
-                if rir_waveform.shape[0] > 1:
-                    rir_waveform = rir_waveform[random.randint(0, rir_waveform.shape[0]-1), :]
-                mixed_clips_batch = reverberate(mixed_clips_batch, rir_waveform, rescale_amp="avg")
+                mixed_clips_batch = reverberate(mixed_clips_batch, load_rir(random.choice(rirs)), rescale_amp="avg")
 
         # Apply volume augmentation
         if volume_augmentation:
@@ -463,7 +569,7 @@ def mix_clips_batch(
         mixed_clips_batch = (mixed_clips_batch.numpy()*32767).astype(np.int16)
 
         # Remove any clips that are silent (happens rarely when mixing/reverberating)
-        error_index = torch.from_numpy(np.where(mixed_clips_batch.max(dim=1) != 0)[0])
+        error_index = torch.from_numpy(np.where(mixed_clips_batch.max(axis=1) != 0)[0])
         mixed_clips_batch = mixed_clips_batch[error_index]
         labels_batch = labels_batch[error_index]
         sequence_labels_batch = sequence_labels_batch[error_index]
@@ -542,13 +648,11 @@ def apply_reverb(x, rir_files):
         nd.array: The reverberated audio clips
     """
     if isinstance(rir_files, str):
-        rir_waveform, sr = torchaudio.load(rir_files[0])
-    elif isinstance(rir_files, list):
-        rir_waveform, sr = torchaudio.load(random.choice(rir_files))
+        rir_waveform = load_rir(rir_files)
+    else:
+        rir_waveform = load_rir(random.choice(rir_files))
 
     # Apply reverberation to the batch (from a single RIR file)
-    if rir_waveform.shape[0] > 1:
-        rir_waveform = rir_waveform[random.randint(0, rir_waveform.shape[0]-1), :]
     reverbed = reverberate(torch.from_numpy(x), rir_waveform, rescale_amp="avg")
 
     return reverbed.numpy()
@@ -624,74 +728,65 @@ def augment_clips(
     ])
 
     # Augmentations that can be done as a batch
-    if background_clip_paths != []:
-        augment2 = torch_audiomentations.Compose([
-            torch_audiomentations.PitchShift(
-                min_transpose_semitones=-3,
-                max_transpose_semitones=3,
-                p=augmentation_probabilities["PitchShift"],
-                sample_rate=16000,
-                mode="per_batch"
-            ),
-            torch_audiomentations.BandStopFilter(p=augmentation_probabilities["BandStopFilter"], mode="per_batch"),
-            torch_audiomentations.AddColoredNoise(
-                min_snr_in_db=10, max_snr_in_db=30,
-                min_f_decay=-1, max_f_decay=2, p=augmentation_probabilities["AddColoredNoise"],
-                mode="per_batch"
-            ),
-            torch_audiomentations.AddBackgroundNoise(
-                p=augmentation_probabilities["AddBackgroundNoise"],
-                background_paths=background_clip_paths,
-                min_snr_in_db=-10,
-                max_snr_in_db=15,
-                mode="per_batch"
-            ),
-            torch_audiomentations.Gain(max_gain_in_db=0, p=augmentation_probabilities["Gain"]),
-        ])
-    else:
-        augment2 = torch_audiomentations.Compose([
-            torch_audiomentations.PitchShift(
-                min_transpose_semitones=-3,
-                max_transpose_semitones=3,
-                p=augmentation_probabilities["PitchShift"],
-                sample_rate=16000,
-                mode="per_batch"
-            ),
-            torch_audiomentations.BandStopFilter(p=augmentation_probabilities["BandStopFilter"], mode="per_batch"),
-            torch_audiomentations.AddColoredNoise(
-                min_snr_in_db=10, max_snr_in_db=30,
-                min_f_decay=-1, max_f_decay=2, p=augmentation_probabilities["AddColoredNoise"],
-                mode="per_batch"
-            ),
-            torch_audiomentations.Gain(max_gain_in_db=0, p=augmentation_probabilities["Gain"]),
-        ])
+    augment2 = torch_audiomentations.Compose([
+        torch_audiomentations.PitchShift(
+            min_transpose_semitones=-3,
+            max_transpose_semitones=3,
+            p=augmentation_probabilities["PitchShift"],
+            sample_rate=sr,
+            mode="per_batch",
+            output_type="dict"
+        ),
+        torch_audiomentations.BandStopFilter(p=augmentation_probabilities["BandStopFilter"], mode="per_batch",
+                                             output_type="dict"),
+        torch_audiomentations.AddColoredNoise(
+            min_snr_in_db=10, max_snr_in_db=30,
+            min_f_decay=-1, max_f_decay=2, p=augmentation_probabilities["AddColoredNoise"],
+            mode="per_batch", output_type="dict"
+        ),
+    ], output_type="dict")
+    add_background_noise = AddBackgroundNoise(
+        background_paths=background_clip_paths,
+        min_snr_in_db=-10,
+        max_snr_in_db=15,
+        p=augmentation_probabilities["AddBackgroundNoise"],
+    )
+    augment3 = torch_audiomentations.Compose([
+        torch_audiomentations.Gain(max_gain_in_db=0, p=augmentation_probabilities["Gain"], output_type="dict"),
+    ], output_type="dict")
+
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     # Iterate through all clips and augment them
     for i in range(0, len(clip_paths), batch_size):
         batch = clip_paths[i:i+batch_size]
         augmented_clips = []
         for clip in batch:
-            clip_data, clip_sr = torchaudio.load(clip)
-            clip_data = clip_data[0]
+            clip_data, clip_sr = load_audio(clip)
+            clip_data = clip_data[0].numpy()
             if clip_data.shape[0] > total_length:
                 clip_data = clip_data[0:total_length]
 
             if clip_sr != sr:
-                raise ValueError("Error! Clip does not have the correct sample rate!")
+                raise ValueError(f"Error! Clip {clip} has a sample rate of {clip_sr} hz instead of {sr} hz!")
 
-            clip_data = create_fixed_size_clip(clip_data, total_length, clip_sr)
+            clip_data = create_fixed_size_clip(clip_data, total_length, clip_sr).astype(np.float32)
 
             # Do first pass augmentations
             augmented_clips.append(torch.from_numpy(augment1(samples=clip_data, sample_rate=sr)))
 
         # Do second pass augmentations
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        augmented_batch = augment2(samples=torch.vstack(augmented_clips).unsqueeze(dim=1).to(device), sample_rate=sr).squeeze(axis=1)
+        augmented_batch = torch.vstack(augmented_clips).unsqueeze(dim=1).to(device)
+        augmented_batch = augment2(samples=augmented_batch, sample_rate=sr).samples.squeeze(dim=1)
+        augmented_batch = add_background_noise(augmented_batch)
+        augmented_batch = augment3(samples=augmented_batch.unsqueeze(dim=1), sample_rate=sr).samples.squeeze(dim=1)
 
         # Do reverberation
         if augmentation_probabilities["RIR"] >= np.random.random() and RIR_paths != []:
-            rir_waveform, sr = torchaudio.load(random.choice(RIR_paths))
-            augmented_batch = reverberate(augmented_batch.cpu(), rir_waveform, rescale_amp="avg")
+            augmented_batch = reverberate(augmented_batch, load_rir(random.choice(RIR_paths)), rescale_amp="avg")
+
+        # Prevent clipping when converting to 16-bit PCM audio
+        augmented_batch = augmented_batch / augmented_batch.abs().max(dim=1, keepdim=True)[0].clamp(min=1.0)
 
         # yield batch of 16-bit PCM audio data
         yield (augmented_batch.cpu().numpy()*32767).astype(np.int16)
@@ -919,49 +1014,41 @@ def generate_adversarial_texts(input_text: str, N: int, include_partial_phrase: 
     # Get phonemes for english vowels (CMUDICT labels)
     vowel_phones = ["AA", "AE", "AH", "AO", "AW", "AX", "AXR", "AY", "EH", "ER", "EY", "IH", "IX", "IY", "OW", "OY", "UH", "UW", "UX"]
 
-    word_phones = []
-    input_text_phones = [pronouncing.phones_for_word(i) for i in input_text.split()]
-
-    # Download phonemizer model for OOV words, if needed
-    if [] in input_text_phones:
-        phonemizer_mdl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "en_us_cmudict_forward.pt")
-        if not os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources")):
-            os.mkdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources"))
-        if not os.path.exists(phonemizer_mdl_path):
-            logging.warning("Downloading phonemizer model from DeepPhonemizer library...")
-            import requests
-            file_url = "https://public-asai-dl-models.s3.eu-central-1.amazonaws.com/DeepPhonemizer/en_us_cmudict_forward.pt"
-            r = requests.get(file_url, stream=True)
-            with open(phonemizer_mdl_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=2048):
-                    if chunk:
-                        f.write(chunk)
-
-        # Create phonemizer object
-        from dp.phonemizer import Phonemizer
-        phonemizer = Phonemizer.from_checkpoint(phonemizer_mdl_path)
-
-    for phones, word in zip(input_text_phones, input_text.split()):
-        if phones != []:
-            word_phones.extend(phones)
-        elif phones == []:
-            logging.warning(f"The word '{word}' was not found in the pronunciation dictionary! "
-                            "Using the DeepPhonemizer library to predict the phonemes.")
-            phones = phonemizer(word, lang='en_us')
-            logging.warning(f"Phones for '{word}': {phones}")
-            word_phones.append(re.sub(r"[\]|\[]", "", re.sub(r"\]\[", " ", phones)))
-        elif isinstance(phones[0], list):
-            logging.warning(f"There are multiple pronunciations for the word '{word}'.")
+    word_phones: List = []
+    phonemizer = None
+    for word in input_text.split():
+        phones = pronouncing.phones_for_word(word)
+        if len(phones) > 1:
+            logging.debug(f"There are multiple pronunciations for the word '{word}', using the first one.")
+        if phones:
             word_phones.append(phones[0])
+            continue
+
+        logging.warning(f"The word '{word}' was not found in the pronunciation dictionary! "
+                        "Using the DeepPhonemizer library to predict the phonemes.")
+        if phonemizer is None:
+            phonemizer = _load_deep_phonemizer()
+        if phonemizer is False:
+            logging.warning(f"No phonemes are available for '{word}', so no phonetically similar words will be "
+                            "generated for it. Consider adding similar sounding phrases to `custom_negative_phrases`.")
+            word_phones.append(None)
+            continue
+        predicted = phonemizer(word, lang='en_us')
+        logging.warning(f"Phones for '{word}': {predicted}")
+        word_phones.append(re.sub(r"[\]|\[]", "", re.sub(r"\]\[", " ", predicted)))
 
     # add all possible lexical stresses to vowels
-    word_phones = [re.sub('|'.join(vowel_phones), lambda x: str(x.group(0)) + '[0|1|2]', re.sub(r'\d+', '', i)) for i in word_phones]
+    word_phones = [re.sub('|'.join(vowel_phones), lambda x: str(x.group(0)) + '[0|1|2]', re.sub(r'\d+', '', i))
+                   if i is not None else None for i in word_phones]
 
     adversarial_phrases = []
     for phones, word in zip(word_phones, input_text.split()):
         query_exps = []
+        adversarial_words: List[str] = []
+        if phones is None:
+            adversarial_phrases.append(adversarial_words)
+            continue
         phones = phones.split()
-        adversarial_words = []
         if len(phones) <= 2:
             query_exps.append(" ".join(phones))
         else:
@@ -973,15 +1060,15 @@ def generate_adversarial_texts(input_text: str, N: int, include_partial_phrase: 
             allowed_matches = [i for i, j in zip(matches, matches_phones) if j != phones]
             adversarial_words.extend([i for i in allowed_matches if word.lower() != i])
 
-        if adversarial_words != []:
-            adversarial_phrases.append(adversarial_words)
+        # always append (even if empty), so that the list stays aligned with the input words
+        adversarial_phrases.append(adversarial_words)
 
     # Build combinations for final output
     adversarial_texts = []
     for i in range(N):
         txts = []
         for j, k in zip(adversarial_phrases, input_text.split()):
-            if np.random.random() > (1 - include_input_words):
+            if j == [] or np.random.random() > (1 - include_input_words):
                 txts.append(k)
             else:
                 txts.append(np.random.choice(j))
@@ -996,6 +1083,63 @@ def generate_adversarial_texts(input_text: str, N: int, include_partial_phrase: 
     adversarial_texts = [i for i in adversarial_texts if i != input_text]
 
     return adversarial_texts
+
+
+DEEP_PHONEMIZER_URL = "https://public-asai-dl-models.s3.eu-central-1.amazonaws.com/DeepPhonemizer/en_us_cmudict_forward.pt"
+
+
+def _load_deep_phonemizer():
+    """Loads the DeepPhonemizer model used for words that are not in the CMU pronunciation dictionary.
+
+    The model path can be set with the `OPENWAKEWORD_PHONEMIZER_MODEL` environment variable, and the download
+    URL with `OPENWAKEWORD_PHONEMIZER_URL` (the original download location has been disabled).
+    The checkpoint is a pickled model, so only use files from sources that you trust.
+
+    Returns:
+        The phonemizer, or False if it is not available.
+    """
+    resources = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources")
+    model_path = os.environ.get("OPENWAKEWORD_PHONEMIZER_MODEL", os.path.join(resources, "en_us_cmudict_forward.pt"))
+    try:
+        from dp.phonemizer import Phonemizer
+    except ImportError:
+        logging.warning("The DeepPhonemizer library is not installed (`pip install deep-phonemizer`).")
+        return False
+
+    if not os.path.exists(model_path):
+        import requests
+        url = os.environ.get("OPENWAKEWORD_PHONEMIZER_URL", DEEP_PHONEMIZER_URL)
+        logging.warning(f"Downloading phonemizer model from '{url}'...")
+        try:
+            r = requests.get(url, stream=True, timeout=60)
+            r.raise_for_status()
+            os.makedirs(os.path.dirname(model_path) or ".", exist_ok=True)
+            with open(model_path + ".part", "wb") as f:
+                for chunk in r.iter_content(chunk_size=1 << 16):
+                    if chunk:
+                        f.write(chunk)
+            os.replace(model_path + ".part", model_path)
+        except Exception as e:
+            logging.warning(f"Could not download the DeepPhonemizer model ({e}). Set OPENWAKEWORD_PHONEMIZER_MODEL "
+                            "to a local copy of 'en_us_cmudict_forward.pt' to enable phoneme prediction.")
+            return False
+
+    # The checkpoint is a full pickle, which torch>=2.6 refuses to load by default (weights_only=True),
+    # so the previous default is restored for this call only.
+    original_torch_load = torch.load
+
+    def _torch_load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return original_torch_load(*args, **kwargs)
+
+    torch.load = _torch_load  # type: ignore[assignment]
+    try:
+        return Phonemizer.from_checkpoint(model_path)
+    except Exception as e:
+        logging.warning(f"Could not load the DeepPhonemizer model from '{model_path}' ({e}).")
+        return False
+    finally:
+        torch.load = original_torch_load
 
 
 def phoneme_replacement(input_chars, max_replace, replace_char='"(.){1,3}"'):

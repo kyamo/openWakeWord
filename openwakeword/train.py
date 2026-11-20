@@ -3,6 +3,7 @@ from torch import optim, nn
 import torchinfo
 import torchmetrics
 import copy
+import inspect
 import os
 import sys
 import tempfile
@@ -426,8 +427,9 @@ class Model(nn.Module):
         # Save ONNX model
         logging.info(f"####\nSaving ONNX mode as '{os.path.join(output_dir, model_name + '.onnx')}'")
         model_to_save = copy.deepcopy(model)
+        export_kwargs = {"dynamo": False} if "dynamo" in inspect.signature(torch.onnx.export).parameters else {}
         torch.onnx.export(model_to_save.to("cpu"), torch.rand(self.input_shape)[None, ],
-                          os.path.join(output_dir, model_name + ".onnx"), opset_version=13)
+                          os.path.join(output_dir, model_name + ".onnx"), opset_version=13, **export_kwargs)
 
         return None
 
@@ -454,8 +456,10 @@ class Model(nn.Module):
                 g['lr'] = self.lr_warmup_cosine_decay(step_ndx, warmup_steps=warmup_steps, hold=hold_steps,
                                                       total_steps=max_steps, target_lr=lr)
 
-            # zero the parameter gradients
-            self.optimizer.zero_grad()
+            # zero the parameter gradients (only after an optimizer step, so that gradients
+            # can accumulate over several small batches)
+            if accumulation_steps == 1:
+                self.optimizer.zero_grad()
 
             # Get predictions for batch
             predictions = self.model(x)
@@ -491,7 +495,8 @@ class Model(nn.Module):
                     accumulated_labels = y_
                 if accumulated_samples < 128:
                     accumulation_steps += 1
-                    accumulated_predictions = torch.cat((accumulated_predictions, predictions))
+                    loss.backward()
+                    accumulated_predictions = torch.cat((accumulated_predictions, predictions.detach()))
                     accumulated_labels = torch.cat((accumulated_labels, y_))
                 else:
                     loss.backward()
@@ -570,10 +575,60 @@ class Model(nn.Module):
                 break
 
 
-# Separate function to convert onnx models to tflite format
+# Functions to convert trained models to the tflite (LiteRT) format
+def convert_torch_to_tflite(model, input_shape, output_path):
+    """Converts a trained PyTorch openwakeword model to the tflite (LiteRT) format with `litert-torch`
+    (https://pypi.org/project/litert-torch/).
+
+    Args:
+        model (torch.nn.Module): The trained model
+        input_shape (tuple): The input shape of the model (without the batch dimension)
+        output_path (str): Where to save the .tflite file
+    """
+    try:
+        import litert_torch
+    except ImportError:
+        import ai_edge_torch as litert_torch  # older name of the same package
+
+    model = copy.deepcopy(model).to("cpu").eval()
+    sample_input = (torch.rand(input_shape, dtype=torch.float32)[None, ],)
+    edge_model = litert_torch.convert(model, sample_input)
+
+    # Check that the converted model matches the original
+    with torch.no_grad():
+        expected = model(*sample_input).numpy()
+    actual = np.asarray(edge_model(*sample_input))
+    if not np.allclose(expected, actual, atol=1e-4):
+        logging.warning(f"The tflite model output differs from the PyTorch model: max abs. difference "
+                        f"{np.abs(expected - actual).max():.6f}")
+
+    logging.info(f"####\nSaving tflite model to '{output_path}'")
+    edge_model.export(output_path)
+
+
 def convert_onnx_to_tflite(onnx_model_path, output_path):
-    """Converts an ONNX version of an openwakeword model to the Tensorflow tflite format."""
-    # imports
+    """Converts an ONNX version of an openwakeword model to the tflite format.
+
+    Uses `onnx2tf` (https://pypi.org/project/onnx2tf/) when available, and falls back to the legacy
+    `onnx_tf` + Tensorflow conversion otherwise. For models trained with `train.py`, prefer `convert_torch_to_tflite`,
+    which does not require Tensorflow.
+    """
+    try:
+        import onnx2tf
+    except ImportError:
+        onnx2tf = None
+
+    if onnx2tf is not None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            onnx2tf.convert(input_onnx_file_path=onnx_model_path, output_folder_path=tmp_dir,
+                            non_verbose=True)
+            tflite_files = sorted(Path(tmp_dir).glob("*_float32.tflite"))
+            if not tflite_files:
+                raise RuntimeError("onnx2tf did not produce a float32 tflite model")
+            logging.info(f"####\nSaving tflite model to '{output_path}'")
+            Path(output_path).write_bytes(tflite_files[0].read_bytes())
+        return None
+
     import onnx
     from onnx_tf.backend import prepare
     import tensorflow as tf
@@ -586,11 +641,55 @@ def convert_onnx_to_tflite(onnx_model_path, output_path):
         converter = tf.lite.TFLiteConverter.from_saved_model(os.path.join(tmp_dir, "tf_model"))
         tflite_model = converter.convert()
 
-        logging.info(f"####\nSaving tflite mode to '{output_path}'")
+        logging.info(f"####\nSaving tflite model to '{output_path}'")
         with open(output_path, 'wb') as f:
             f.write(tflite_model)
 
     return None
+
+
+def load_sample_generator(config):
+    """Returns a `generate_samples(**kwargs)` function for synthetic clip generation with Piper.
+
+    Supports both the current upstream piper-sample-generator (https://github.com/rhasspy/piper-sample-generator),
+    either installed or referenced via `piper_sample_generator_path`, and the older fork at
+    https://github.com/dscripka/piper-sample-generator. The voice model can be set with the
+    `piper_sample_generator_model` config key: a generator checkpoint (.pt) or any Piper voice (.onnx),
+    which also allows training wake words in other languages than English.
+    """
+    path = config.get("piper_sample_generator_path")
+    model = config.get("piper_sample_generator_model")
+    if path:
+        sys.path.insert(0, os.path.abspath(path))
+
+    try:
+        from piper_sample_generator.__main__ import generate_samples as _generate
+        try:
+            from piper_sample_generator.__main__ import generate_samples_onnx as _generate_onnx
+        except ImportError:
+            _generate_onnx = None
+        if model is None:
+            candidates = sorted(Path(path or ".").glob("models/*.pt"))
+            if not candidates:
+                raise ValueError("Please set `piper_sample_generator_model` in the training config to the path of a "
+                                 "piper-sample-generator model (.pt) or a Piper voice (.onnx)")
+            model = str(candidates[0])
+    except ImportError:
+        from generate_samples import generate_samples as _generate  # dscripka/piper-sample-generator
+        _generate_onnx = None
+
+    def generate_samples(**kwargs):
+        if model is not None:
+            kwargs["model"] = model
+        if model is not None and str(model).endswith(".onnx"):
+            if _generate_onnx is None:
+                raise ValueError("Piper voices (.onnx) require the current rhasspy/piper-sample-generator")
+            kwargs.pop("batch_size", None)
+            kwargs.pop("auto_reduce_batch_size", None)
+            return _generate_onnx(**kwargs)
+        return _generate(**kwargs)
+
+    return generate_samples
 
 
 if __name__ == '__main__':
@@ -639,12 +738,12 @@ if __name__ == '__main__':
     )
 
     args = parser.parse_args()
-    config = yaml.load(open(args.training_config, 'r').read(), yaml.Loader)
+    with open(args.training_config, "r") as config_file:
+        config = yaml.safe_load(config_file)
 
     # imports Piper for synthetic sample generation
-    if config.get("piper_sample_generator_path"):
-        sys.path.insert(0, os.path.abspath(config["piper_sample_generator_path"]))
-        from generate_samples import generate_samples
+    if args.generate_clips is True:
+        generate_samples = load_sample_generator(config)
 
     # Define output locations
     config["output_dir"] = os.path.abspath(config["output_dir"])
@@ -660,6 +759,9 @@ if __name__ == '__main__':
     feature_save_dir = os.path.join(config["output_dir"], config["model_name"])
 
     # Get paths for impulse response and background audio files
+    config.setdefault("rir_paths", [])
+    config.setdefault("background_paths", [])
+    config.setdefault("background_paths_duplication_rate", [])
     rir_paths = [i.path for j in config["rir_paths"] for i in os.scandir(j)]
     background_paths = []
     if len(config["background_paths_duplication_rate"]) != len(config["background_paths"]):
@@ -705,7 +807,7 @@ if __name__ == '__main__':
             os.mkdir(negative_train_output_dir)
         n_current_samples = len(os.listdir(negative_train_output_dir))
         if n_current_samples <= 0.95*config["n_samples"]:
-            adversarial_texts = config["custom_negative_phrases"]
+            adversarial_texts = list(config.get("custom_negative_phrases") or [])
             for target_phrase in config["target_phrase"]:
                 adversarial_texts.extend(generate_adversarial_texts(
                     input_text=target_phrase,
@@ -728,7 +830,7 @@ if __name__ == '__main__':
             os.mkdir(negative_test_output_dir)
         n_current_samples = len(os.listdir(negative_test_output_dir))
         if n_current_samples <= 0.95*config["n_samples_val"]:
-            adversarial_texts = config["custom_negative_phrases"]
+            adversarial_texts = list(config.get("custom_negative_phrases") or [])
             for target_phrase in config["target_phrase"]:
                 adversarial_texts.extend(generate_adversarial_texts(
                     input_text=target_phrase,
@@ -760,7 +862,9 @@ if __name__ == '__main__':
 
     # Do Data Augmentation
     if args.augment_clips is True:
-        if not os.path.exists(os.path.join(feature_save_dir, "positive_features_train.npy")) or args.overwrite is True:
+        feature_files = [os.path.join(feature_save_dir, f"{i}_features_{j}.npy")
+                         for i in ("positive", "negative") for j in ("train", "test")]
+        if not all(os.path.exists(i) for i in feature_files) or args.overwrite is True:
             positive_clips_train = [str(i) for i in Path(positive_train_output_dir).glob("*.wav")]*config["augmentation_rounds"]
             positive_clips_train_generator = augment_clips(positive_clips_train, total_length=config["total_length"],
                                                            batch_size=config["augmentation_batch_size"],
@@ -787,30 +891,26 @@ if __name__ == '__main__':
 
             # Compute features and save to disk via memmapped arrays
             logging.info("#"*50 + "\nComputing openwakeword features for generated samples\n" + "#"*50)
-            n_cpus = os.cpu_count()
-            if n_cpus is None:
-                n_cpus = 1
-            else:
-                n_cpus = n_cpus//2
-            compute_features_from_generator(positive_clips_train_generator, n_total=len(os.listdir(positive_train_output_dir)),
+            n_cpus = max(1, (os.cpu_count() or 2)//2)
+            compute_features_from_generator(positive_clips_train_generator, n_total=len(positive_clips_train),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "positive_features_train.npy"),
                                             device="gpu" if torch.cuda.is_available() else "cpu",
                                             ncpu=n_cpus if not torch.cuda.is_available() else 1)
 
-            compute_features_from_generator(negative_clips_train_generator, n_total=len(os.listdir(negative_train_output_dir)),
+            compute_features_from_generator(negative_clips_train_generator, n_total=len(negative_clips_train),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "negative_features_train.npy"),
                                             device="gpu" if torch.cuda.is_available() else "cpu",
                                             ncpu=n_cpus if not torch.cuda.is_available() else 1)
 
-            compute_features_from_generator(positive_clips_test_generator, n_total=len(os.listdir(positive_test_output_dir)),
+            compute_features_from_generator(positive_clips_test_generator, n_total=len(positive_clips_test),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "positive_features_test.npy"),
                                             device="gpu" if torch.cuda.is_available() else "cpu",
                                             ncpu=n_cpus if not torch.cuda.is_available() else 1)
 
-            compute_features_from_generator(negative_clips_test_generator, n_total=len(os.listdir(negative_test_output_dir)),
+            compute_features_from_generator(negative_clips_test_generator, n_total=len(negative_clips_test),
                                             clip_duration=config["total_length"],
                                             output_file=os.path.join(feature_save_dir, "negative_features_test.npy"),
                                             device="gpu" if torch.cuda.is_available() else "cpu",
@@ -864,16 +964,12 @@ if __name__ == '__main__':
             def __iter__(self):
                 return self.generator
 
-        n_cpus = os.cpu_count()
-        if n_cpus is None:
-            n_cpus = 1
-        else:
-            n_cpus = n_cpus//2
+        n_cpus = max(1, (os.cpu_count() or 2)//2)
         X_train = torch.utils.data.DataLoader(IterDataset(batch_generator),
                                               batch_size=None, num_workers=n_cpus, prefetch_factor=16)
 
         X_val_fp = np.load(config["false_positive_validation_data_path"])
-        X_val_fp = np.array([X_val_fp[i:i+input_shape[0]] for i in range(0, X_val_fp.shape[0]-input_shape[0], 1)])  # reshape to match model
+        X_val_fp = np.lib.stride_tricks.sliding_window_view(X_val_fp, input_shape[0], axis=0, writeable=True)[:-1].transpose(0, 2, 1)
         X_val_fp_labels = np.zeros(X_val_fp.shape[0]).astype(np.float32)
         X_val_fp = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(torch.from_numpy(X_val_fp), torch.from_numpy(X_val_fp_labels)),
@@ -905,7 +1001,7 @@ if __name__ == '__main__':
         # Export the trained model to onnx
         oww.export_model(model=best_model, model_name=config["model_name"], output_dir=config["output_dir"])
 
-        # Convert the model from onnx to tflite format
-        if args.convert_to_tflite:
-            convert_onnx_to_tflite(os.path.join(config["output_dir"], config["model_name"] + ".onnx"),
-                                   os.path.join(config["output_dir"], config["model_name"] + ".tflite"))
+        # Convert the model to tflite format
+        if args.convert_to_tflite is True:
+            convert_torch_to_tflite(best_model, input_shape,
+                                    os.path.join(config["output_dir"], config["model_name"] + ".tflite"))
