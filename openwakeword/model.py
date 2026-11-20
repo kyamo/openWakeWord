@@ -199,7 +199,11 @@ class Model():
 
         # Initialize SpeexDSP noise canceller
         if enable_speex_noise_suppression:
-            from speexdsp_ns import NoiseSuppression
+            try:
+                from speexdsp_ns import NoiseSuppression
+            except ImportError as e:
+                raise ImportError("Speex noise suppression requires the `speexdsp-ns` package (Linux only). "
+                                  "Install it with `pip install openwakeword[speex]`.") from e
             self.speex_ns = NoiseSuppression.create(160, 16000)
         else:
             self.speex_ns = None

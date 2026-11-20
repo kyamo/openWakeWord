@@ -11,6 +11,11 @@ openWakeWord is an open-source wakeword library that can be used to create voice
 
 # Updates
 
+**2026/11/20 (v0.7.0, this fork)**
+- Python 3.10 – 3.14 support, packaging moved to `pyproject.toml`, and the [LiteRT](https://pypi.org/project/ai-edge-litert/) runtime is now installed on all platforms (including Windows).
+- The training pipeline (`openwakeword.train`) works with current PyTorch/torchaudio releases: speechbrain, acoustics and onnx-tf/Tensorflow are no longer needed, tflite models are exported with [litert-torch](https://pypi.org/project/litert-torch/), and the current [piper-sample-generator](https://github.com/rhasspy/piper-sample-generator) is supported, including any Piper voice (`.onnx`) for non-English wake words.
+- Several bug fixes in training and inference, see the [changelog](CHANGELOG.md).
+
 **2024/02/11**
 - v0.6.0 of openWakeWord released. See the [releases](https://github.com/dscripka/openWakeWord/releases) for a full descriptions of new features and changes.
 
@@ -37,13 +42,19 @@ Installing openWakeWord is simple and has minimal dependencies:
 pip install openwakeword
 ```
 
-On Linux systems, both the [onnxruntime](https://pypi.org/project/onnxruntime/) package and [tflite-runtime](https://pypi.org/project/tflite-runtime/) packages will be installed as dependencies since both inference frameworks are supported. On Windows, only onnxruntime is installed due to a lack of support for modern versions of tflite.
+Both the [onnxruntime](https://pypi.org/project/onnxruntime/) package and the [LiteRT](https://pypi.org/project/ai-edge-litert/) (formerly tflite-runtime) package are installed as dependencies, since both inference frameworks are supported.
 
-To (optionally) use [Speex](https://www.speex.org/) noise suppression on Linux systems to improve performance in noisy environments, install the Speex dependencies and then the pre-built Python package (see the assets [here](https://github.com/dscripka/openWakeWord/releases/tag/v0.1.1) for all .whl versions), adjusting for your python version and system architecture as needed.
+To (optionally) use [Speex](https://www.speex.org/) noise suppression on Linux systems to improve performance in noisy environments, install the Speex dependencies and the `speex` extra. Pre-built wheels exist for Python <= 3.12, for newer versions the package is built from source.
 
 ```
 sudo apt-get install libspeexdsp-dev
-pip install https://github.com/dscripka/openWakeWord/releases/download/v0.1.1/speexdsp_ns-0.1.2-cp38-cp38-linux_x86_64.whl
+pip install "openwakeword[speex]"
+```
+
+The dependencies for training custom models are available as the `train` extra (and `tflite` for exporting trained models to the tflite format):
+
+```
+pip install "openwakeword[train,tflite]"
 ```
 
 Many thanks to [TeaPoly](https://github.com/TeaPoly/speexdsp-ns-python) for their Python wrapper of the Speex noise suppression libraries.
@@ -221,7 +232,7 @@ While the models are trained with background noise to increase robustness, in so
 
 openWakeWord includes an automated utility that greatly simplifies the process of training custom models. This can be used in two ways:
 
-1) A simple [Google Colab](https://colab.research.google.com/drive/1q1oe2zOyZp7UsB3jJiQ1IFn8z5YfjwEb?usp=sharing) notebook with an easy to use interface and simple end-to-end process. This allows anyone to produce a custom model very quickly (<1 hour) and doesn't require any development experience, but the performance of the model may be low in some deployment scenarios.
+1) A simple [Google Colab](https://colab.research.google.com/drive/1q1oe2zOyZp7UsB3jJiQ1IFn8z5YfjwEb?usp=sharing) notebook with an easy to use interface and simple end-to-end process. This allows anyone to produce a custom model very quickly (<1 hour) and doesn't require any development experience, but the performance of the model may be low in some deployment scenarios. Note that this notebook is not maintained in this repository and may not work with current Colab runtimes; the command line process described [below](#training-from-the-command-line) works with current library versions.
 
 2) A more detailed [notebook](notebooks/automatic_model_training.ipynb) that describes the training process in more details, and enables more customization. This can produce high quality models, but requires more development experience.
 
@@ -235,11 +246,33 @@ Fundamentally, a new model requires two data generation and collection steps:
 
 2) Collect negative data (e.g., audio where the wakeword/phrase is not present) to help the model have a low false-accept rate. This also benefits from scale, and the [included models](#pre-trained-models) were all trained with ~30,000 hours of negative data representing speech, noise, and music. See the individual model documentation pages for more details on training data curation and preparation.
 
+## Training from the command line
+
+With the `train` (and optionally `tflite`) extras installed, a model can be trained from a YAML config file (see [examples/custom_model.yml](examples/custom_model.yml) for all options):
+
+```
+git clone https://github.com/rhasspy/piper-sample-generator
+wget -O piper-sample-generator/models/en_US-libritts_r-medium.pt \
+  https://github.com/rhasspy/piper-sample-generator/releases/download/v2.0.0/en_US-libritts_r-medium.pt
+pip install -e ./piper-sample-generator
+
+python -m openwakeword.train --training_config my_model.yml --generate_clips
+python -m openwakeword.train --training_config my_model.yml --augment_clips
+python -m openwakeword.train --training_config my_model.yml --train_model --convert_to_tflite
+```
+
+The steps can also be combined into one command. Notes:
+
+- `piper_sample_generator_path` points to a checkout of [rhasspy/piper-sample-generator](https://github.com/rhasspy/piper-sample-generator) (the older [dscripka fork](https://github.com/dscripka/piper-sample-generator) is also supported), and `piper_sample_generator_model` selects the voice: a generator checkpoint (`.pt`) or any [Piper voice](https://huggingface.co/rhasspy/piper-voices) (`.onnx`).
+- Feature files are written atomically, so an interrupted `--augment_clips` run is simply repeated. Use `--overwrite` to recompute existing features.
+- `--convert_to_tflite` uses [litert-torch](https://pypi.org/project/litert-torch/) and does not need Tensorflow.
+- For words that are not in the CMU pronunciation dictionary, adversarial negative phrases are generated with [DeepPhonemizer](https://github.com/as-ideas/DeepPhonemizer). Its original model download has been disabled, so set the `OPENWAKEWORD_PHONEMIZER_MODEL` environment variable to a local copy of `en_us_cmudict_forward.pt` (only from a source you trust, as it is a pickled model). Without it, no phonetically similar words are generated for these words, and it is recommended to add similar sounding phrases to `custom_negative_phrases`.
+
 # Language Support
 
-Currently, openWakeWord only supports English, primarily because the pre-trained text-to-speech models used to generate training data are all based on english datasets. It's likely that speech-to-text models trained on other languages would also work well, but non-english models & datasets are less commonly available.
+The included pre-trained models only support English, primarily because the pre-trained text-to-speech models used to generate their training data are all based on English datasets.
 
-Future release road maps may have non-english support. In particular, [Mycroft.AIs Mimic 3](https://github.com/MycroftAI/mimic3-voices) TTS engine may work well to help extend some support to other languages.
+Custom models can be trained for other languages by generating the training data with a [Piper voice](https://huggingface.co/rhasspy/piper-voices) of the target language (set `piper_sample_generator_model` to the `.onnx` voice file, see [above](#training-from-the-command-line)). Note that the automatic generation of adversarial negative phrases is based on an English pronunciation dictionary, so for other languages it is important to provide phonetically similar phrases via `custom_negative_phrases`.
 
 # FAQ
 

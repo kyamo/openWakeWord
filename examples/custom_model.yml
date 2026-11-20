@@ -25,8 +25,14 @@ tts_batch_size: 50
 # It's recommended that this not be too large to ensure that there is enough variety in the augmentation
 augmentation_batch_size: 16
 
-# The path to a fork of the piper-sample-generator repository for TTS (https://github.com/dscripka/piper-sample-generator)
+# The path to a checkout of the piper-sample-generator repository for TTS (https://github.com/rhasspy/piper-sample-generator).
+# The older fork at https://github.com/dscripka/piper-sample-generator is also supported.
 piper_sample_generator_path: "./piper-sample-generator"
+
+# The voice used to generate clips: a piper-sample-generator checkpoint (.pt, e.g. models/en_US-libritts_r-medium.pt)
+# or any Piper voice (.onnx, https://huggingface.co/rhasspy/piper-voices), which also allows other languages than English.
+# If not set, the first .pt file in the `models` directory of `piper_sample_generator_path` is used.
+# piper_sample_generator_model: "./piper-sample-generator/models/en_US-libritts_r-medium.pt"
 
 # The output directory for the generated synthetic clips, openwakeword features, and trained models
 # Sub-directories will be automatically created for train and test clips for both positive and negative examples

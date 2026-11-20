@@ -481,7 +481,7 @@ def mix_clips_batch(
 
     # Check and Set start indices, if needed
     if not start_index:
-        start_index = [0]*batch_size
+        start_index = [0]*len(foreground_clips)
     else:
         if min(start_index) < 0:
             raise ValueError("Error! At least one value of the `start_index` argument is <0. Check your inputs.")
@@ -556,8 +556,9 @@ def mix_clips_batch(
 
         # Apply volume augmentation
         if volume_augmentation:
-            volume_levels = np.random.uniform(0.02, 1.0, mixed_clips_batch.shape[0])
-            mixed_clips_batch = (volume_levels/mixed_clips_batch.max(dim=1)[0])[..., None]*mixed_clips_batch
+            volume_levels = torch.from_numpy(np.random.uniform(0.02, 1.0, mixed_clips_batch.shape[0])).to(mixed_clips_batch.dtype)
+            peak = mixed_clips_batch.abs().max(dim=1)[0].clamp(min=1e-9)
+            mixed_clips_batch = (volume_levels/peak)[..., None]*mixed_clips_batch
         else:
             # Normalize clips only if max value is outside of [-1, 1]
             abs_max, _ = torch.max(
@@ -566,20 +567,20 @@ def mix_clips_batch(
             mixed_clips_batch = mixed_clips_batch / abs_max.clamp(min=1.0)
 
         # Convert to 16-bit PCM audio
-        mixed_clips_batch = (mixed_clips_batch.numpy()*32767).astype(np.int16)
+        mixed_clips_pcm = (mixed_clips_batch.numpy()*32767).astype(np.int16)
 
         # Remove any clips that are silent (happens rarely when mixing/reverberating)
-        error_index = torch.from_numpy(np.where(mixed_clips_batch.max(axis=1) != 0)[0])
-        mixed_clips_batch = mixed_clips_batch[error_index]
+        error_index = torch.from_numpy(np.where(mixed_clips_pcm.max(axis=1) != 0)[0])
+        mixed_clips_pcm = mixed_clips_pcm[error_index]
         labels_batch = labels_batch[error_index]
         sequence_labels_batch = sequence_labels_batch[error_index]
 
         if not return_background_clips:
-            yield mixed_clips_batch, labels_batch if not return_sequence_labels else sequence_labels_batch, None
+            yield mixed_clips_pcm, labels_batch if not return_sequence_labels else sequence_labels_batch, None
         else:
             background_clips_batch_delayed = (torch.vstack(background_clips_batch_delayed).numpy()
                                               * 32767).astype(np.int16)[error_index]
-            yield (mixed_clips_batch,
+            yield (mixed_clips_pcm,
                    labels_batch if not return_sequence_labels else sequence_labels_batch,
                    background_clips_batch_delayed)
 
@@ -762,8 +763,8 @@ def augment_clips(
         batch = clip_paths[i:i+batch_size]
         augmented_clips = []
         for clip in batch:
-            clip_data, clip_sr = load_audio(clip)
-            clip_data = clip_data[0].numpy()
+            clip_tensor, clip_sr = load_audio(clip)
+            clip_data = clip_tensor[0].numpy()
             if clip_data.shape[0] > total_length:
                 clip_data = clip_data[0:total_length]
 

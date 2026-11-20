@@ -1,4 +1,4 @@
-# This workflow will install Python dependencies, run tests and lint with a variety of Python versions
+# Runs linting, the inference unit tests on all supported platforms/Python versions, and the training tests
 # For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
 
 name: Unit Tests
@@ -10,44 +10,73 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  unit_tests_linux:
+  lint:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.10"]
-
     steps:
-    - uses: actions/checkout@v3
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
+    - uses: actions/checkout@v5
+    - uses: actions/setup-python@v6
       with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      run: |
-        sudo apt-get install libspeexdsp-dev
-        python -m pip install --upgrade pip
-        pip install -e .[test]
-    - name: Test with pytest
-      run: |
-        pytest
-  
-  unit_tests_windows:
-    runs-on: windows-latest
-    strategy:
-      matrix:
-        python-version: ["3.10"]
-
-    steps:
-    - uses: actions/checkout@v3
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
+        python-version: "3.13"
+    - name: Run flake8
       run: |
         python -m pip install --upgrade pip
-        pip install -e .[test]
+        pip install "flake8>=7,<8"
+        flake8 openwakeword tests
+
+  unit_tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: windows-latest
+            python-version: "3.13"
+          - os: macos-latest
+            python-version: "3.13"
+
+    steps:
+    - uses: actions/checkout@v5
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: pip
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[test]"
+    - name: Install Speex noise suppression (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update && sudo apt-get install -y libspeexdsp-dev swig
+        pip install -e ".[speex]" || echo "speexdsp-ns could not be installed, the Speex tests will be skipped"
     - name: Test with pytest
       run: |
-        pytest
+        pytest tests/test_models.py tests/test_custom_verifier_model.py tests/test_metrics.py openwakeword
+
+  training_tests:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+        cache: pip
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch --index-url https://download.pytorch.org/whl/cpu
+        pip install -e ".[train,tflite,test]" --extra-index-url https://download.pytorch.org/whl/cpu
+    - name: Test with pytest
+      run: |
+        pytest tests/test_data.py tests/test_train.py
