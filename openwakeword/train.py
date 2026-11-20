@@ -260,14 +260,22 @@ class Model(nn.Module):
         return best_model
 
     def auto_train(self, X_train, X_val, false_positive_val_data, steps=50000, max_negative_weight=1000,
-                   target_fp_per_hour=0.2):
+                   target_fp_per_hour=0.2, val_set_hrs=None):
         """A sequence of training steps that produce relatively strong models
         automatically, based on validation data and performance targets provided.
         After training merges the best checkpoints and returns a single model.
+
+        `val_set_hrs` is the duration of the false positive validation data in hours. By default it is
+        determined from the number of examples in `false_positive_val_data` (one example per 80 ms frame).
         """
 
         # Get false positive validation data duration
-        val_set_hrs = 11.3
+        if val_set_hrs is None:
+            try:
+                val_set_hrs = len(false_positive_val_data.dataset)*1280/16000/3600
+            except (AttributeError, TypeError):
+                val_set_hrs = 11.3  # duration of the default validation set
+        logging.info(f"Duration of the false positive validation data: {val_set_hrs:.2f} hours")
 
         # Sequence 1
         logging.info("#"*50 + "\nStarting training sequence 1...\n" + "#"*50)
@@ -294,7 +302,7 @@ class Model(nn.Module):
             logging.info("Increasing weight on negative examples to reduce false positives...")
 
         weights = np.linspace(1, max_negative_weight, int(steps)).tolist()
-        val_steps = np.linspace(1, steps, 20).astype(np.int16)
+        val_steps = np.linspace(1, steps, 20).astype(np.int64)
         self.train_model(
                     X=X_train,
                     X_val=X_val,
@@ -314,7 +322,7 @@ class Model(nn.Module):
             logging.info("Increasing weight on negative examples to reduce false positives...")
 
         weights = np.linspace(1, max_negative_weight, int(steps)).tolist()
-        val_steps = np.linspace(1, steps, 20).astype(np.int16)
+        val_steps = np.linspace(1, steps, 20).astype(np.int64)
         self.train_model(
                     X=X_train,
                     X_val=X_val,
@@ -570,6 +578,8 @@ class Model(nn.Module):
                                                    "val_fp_per_hr": self.history.get("val_fp_per_hr", [0])[-1]})
                     self.best_val_recall = self.history["val_recall"][-1]
                     self.best_val_accuracy = self.history["val_accuracy"][-1]
+                    if self.history.get("val_fp_per_hr"):
+                        self.best_val_fp = min(self.best_val_fp, float(self.history["val_fp_per_hr"][-1]))
 
             if step_ndx == max_steps-1:
                 break
