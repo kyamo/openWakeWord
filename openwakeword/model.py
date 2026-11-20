@@ -184,15 +184,17 @@ class Model():
             # Load custom verifier models
             if isinstance(custom_verifier_models, dict):
                 if custom_verifier_models.get(mdl_name, False):
-                    self.custom_verifier_models[mdl_name] = pickle.load(open(custom_verifier_models[mdl_name], 'rb'))
+                    with open(custom_verifier_models[mdl_name], 'rb') as verifier_file:
+                        self.custom_verifier_models[mdl_name] = pickle.load(verifier_file)
 
-            if len(self.custom_verifier_models.keys()) < len(custom_verifier_models.keys()):
-                raise ValueError(
-                    "Custom verifier models were provided, but some were not matched with a base model!"
-                    " Make sure that the keys provided in the `custom_verifier_models` dictionary argument"
-                    " exactly match that of the `.models` attribute of an instantiated openWakeWord Model object"
-                    " that has the same base models but doesn't have custom verifier models."
-                )
+        # Check that all custom verifier models were matched to a base model (after loading all models)
+        if len(self.custom_verifier_models.keys()) < len(custom_verifier_models.keys()):
+            raise ValueError(
+                "Custom verifier models were provided, but some were not matched with a base model!"
+                " Make sure that the keys provided in the `custom_verifier_models` dictionary argument"
+                " exactly match that of the `.models` attribute of an instantiated openWakeWord Model object"
+                " that has the same base models but doesn't have custom verifier models."
+            )
 
         # Create buffer to store frame predictions
         self.prediction_buffer: DefaultDict[str, deque] = defaultdict(partial(deque, maxlen=30))
@@ -413,13 +415,12 @@ class Model():
         Returns:
             list: A list containing the frame-level prediction dictionaries for the audio clip
         """
-        if isinstance(clip, str):
-            # Load audio clip as 16-bit PCM data
-            with wave.open(clip, mode='rb') as f:
-                # Load WAV clip frames
-                data = np.frombuffer(f.readframes(f.getnframes()), dtype=np.int16)
+        if isinstance(clip, (str, os.PathLike)):
+            data = _read_wav(clip)
         elif isinstance(clip, np.ndarray):
             data = clip
+        else:
+            raise ValueError(f"The clip must be a path to a WAV file or a numpy array, not {type(clip)}")
 
         if padding:
             data = np.concatenate(
@@ -464,10 +465,7 @@ class Model():
                   where N is the number of examples and M is the number
                   of audio features, depending on the model input shape.
         """
-        # Load audio clip as 16-bit PCM data
-        with wave.open(file, mode='rb') as f:
-            # Load WAV clip frames
-            data = np.frombuffer(f.readframes(f.getnframes()), dtype=np.int16)
+        data = _read_wav(file)
 
         # Iterate through clip, getting predictions
         positive_data = defaultdict(list)
@@ -515,3 +513,12 @@ class Model():
         cleaned_bytestring = b''.join(cleaned)
         cleaned_array = np.frombuffer(cleaned_bytestring, np.int16)
         return cleaned_array
+
+
+def _read_wav(path) -> np.ndarray:
+    """Reads a 16-bit PCM, 16 khz, single-channel WAV file as a numpy array"""
+    with wave.open(str(path), mode='rb') as f:
+        if f.getframerate() != 16000 or f.getnchannels() != 1 or f.getsampwidth() != 2:
+            raise ValueError(f"'{path}' must be a 16-bit PCM, 16 khz, single-channel WAV file, but it has "
+                             f"{f.getsampwidth()*8} bits, {f.getframerate()} hz, and {f.getnchannels()} channel(s).")
+        return np.frombuffer(f.readframes(f.getnframes()), dtype=np.int16)

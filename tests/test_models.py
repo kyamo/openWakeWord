@@ -328,3 +328,33 @@ class TestModels:
         clip = os.path.join("tests", "data", "alexa_test.wav")
         features = owwModel._get_positive_prediction_frames(clip)
         assert list(features.values())[0].shape[0] > 0
+
+
+def test_custom_verifier_for_second_model_only(tmp_path):
+    # A verifier model for a model that is loaded after another model must not raise an error
+    verifier_model = openwakeword.custom_verifier_model.train_verifier_model(np.random.random((2, 1536)), np.array([0, 1]))
+    with open(tmp_path / "verifier.pkl", "wb") as f:
+        pickle.dump(verifier_model, f)
+
+    owwModel = openwakeword.Model(
+        wakeword_models=[os.path.join("openwakeword", "resources", "models", f"{i}.onnx") for i in ["alexa_v0.1", "hey_mycroft_v0.1"]],
+        inference_framework="onnx",
+        custom_verifier_models={"hey_mycroft_v0.1": str(tmp_path / "verifier.pkl")},
+        custom_verifier_threshold=0.0
+    )
+    for _ in range(10):
+        predictions = owwModel.predict(np.random.randint(-1000, 1000, 1280).astype(np.int16))
+    assert set(predictions.keys()) == {"alexa_v0.1", "hey_mycroft_v0.1"}
+
+
+def test_predict_clip_rejects_wrong_format(tmp_path):
+    path = str(tmp_path / "8khz.wav")
+    with wave.open(path, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(8000)
+        f.writeframes(np.zeros(8000, dtype=np.int16).tobytes())
+
+    owwModel = openwakeword.Model(wakeword_models=["alexa"], inference_framework="onnx")
+    with pytest.raises(ValueError):
+        owwModel.predict_clip(path)
