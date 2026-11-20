@@ -201,3 +201,11 @@ def test_augment_clips_resamples(tmp_path):
     batch = next(data.augment_clips([clip], total_length=32000, batch_size=1, augmentation_probabilities=probabilities))
     assert batch.shape == (1, 32000)
     assert np.count_nonzero(batch) == pytest.approx(16000, abs=300)  # 1 s of audio at 16 khz
+
+
+def test_generate_adversarial_texts_excludes_homophones():
+    # "hay" sounds exactly like "hey" and must not be used as an adversarial (negative) word
+    np.random.seed(0)
+    texts = data.generate_adversarial_texts("hey jarvis", N=2000, include_partial_phrase=1.0, include_input_words=0.2)
+    first_words = {t.split()[0] for t in texts}
+    assert first_words.isdisjoint({"hay", "haye", "hae"})

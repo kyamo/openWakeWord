@@ -1071,12 +1071,15 @@ def generate_adversarial_texts(input_text: str, N: int, include_partial_phrase: 
         logging.warning(f"Phones for '{word}': {predicted}")
         word_phones.append(re.sub(r"[\]|\[]", "", re.sub(r"\]\[", " ", predicted)))
 
+    # phonemes without lexical stress, used to exclude homophones of the input words (e.g., "hay" for "hey")
+    base_phones = [re.sub(r'\d+', '', i) if i is not None else None for i in word_phones]
+
     # add all possible lexical stresses to vowels
     word_phones = [re.sub('|'.join(vowel_phones), lambda x: str(x.group(0)) + '[0|1|2]', re.sub(r'\d+', '', i))
                    if i is not None else None for i in word_phones]
 
     adversarial_phrases = []
-    for phones, word in zip(word_phones, input_text.split()):
+    for phones, word, word_base_phones in zip(word_phones, input_text.split(), base_phones):
         query_exps = []
         adversarial_words: List[str] = []
         if phones is None:
@@ -1091,7 +1094,7 @@ def generate_adversarial_texts(input_text: str, N: int, include_partial_phrase: 
         for query in query_exps:
             matches = pronouncing.search(query)
             matches_phones = [pronouncing.phones_for_word(i)[0] for i in matches]
-            allowed_matches = [i for i, j in zip(matches, matches_phones) if j != phones]
+            allowed_matches = [i for i, j in zip(matches, matches_phones) if re.sub(r'\d+', '', j) != word_base_phones]
             adversarial_words.extend([i for i in allowed_matches if word.lower() != i])
 
         # always append (even if empty), so that the list stays aligned with the input words

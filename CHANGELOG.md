@@ -41,6 +41,9 @@
 * `Model.reset()` did not reset the VAD and Speex noise suppression state, so results depended on previous audio
 * `predict_clip` silently produced wrong scores for WAV files that are not 16-bit, 16 khz, mono; it now raises a `ValueError`
 * `train_custom_verifier` did not reset the model between clips
+* Homophones of the target words (e.g. "hay jarvis" for "hey jarvis") were generated as adversarial negative phrases
+* Generated clips from the current piper-sample-generator and most Piper voices (22.05 khz) made augmentation fail;
+  they are now converted to 16 khz, and `augment_clips` resamples other sample rates
 * `trim_mmap` mangled relative paths and file names ending in "n", "p" or "y" (`str.strip(".npy")`)
 * `convert_clips` passed file names through a shell and ignored the `sr` argument
 * `auto_train` assumed an 11.3 hour false positive validation set, and never updated the best false positive rate,
