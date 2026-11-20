@@ -1,5 +1,41 @@
 # Change Log
 
+## v0.7.0 - 2026/11/20
+
+### Added
+
+* Support for Python 3.10 - 3.14; the LiteRT runtime (`ai-edge-litert`) is installed on all platforms
+* New extras: `train` (training dependencies), `tflite` (tflite export with `litert-torch`), `speex` (Speex noise suppression)
+* `openwakeword.train` supports the current [rhasspy/piper-sample-generator](https://github.com/rhasspy/piper-sample-generator),
+  including Piper voices (`.onnx`) via the new `piper_sample_generator_model` config key, which allows training non-English wake words
+* `convert_torch_to_tflite` exports trained models to tflite without Tensorflow; `convert_onnx_to_tflite` uses `onnx2tf` when available
+* Audio helpers in `openwakeword.data`: `load_audio`, `reverberate`, `generate_colored_noise`, `AddBackgroundNoise`
+* Tests for the training data pipeline, model export and the false positive metric
+
+### Changed
+
+* Packaging uses `pyproject.toml` only; `speexdsp-ns` is now optional (`pip install openwakeword[speex]`)
+* Removed the dependencies on speechbrain, acoustics, torchaudio I/O, onnx-tf and Tensorflow for training
+* The DeepPhonemizer model location is configurable (`OPENWAKEWORD_PHONEMIZER_MODEL`, `OPENWAKEWORD_PHONEMIZER_URL`),
+  as the original download has been disabled; without it, training continues without phoneme predictions for unknown words
+* The streaming melspectrogram only copies the newest audio samples (upstream PR #356)
+* Validation data for training is windowed with a strided view instead of a copy, greatly reducing memory use
+* CI uses current GitHub Actions and tests Linux, Windows and macOS
+
+### Fixed
+
+* `augmentation_rounds` > 1 had no effect, because the feature arrays were sized for one round
+* An interrupted feature computation left a partial `.npy` file that was silently used for training
+* Gradients of small batches were discarded before gradient accumulation could use them
+* `custom_negative_phrases` was modified in place, leaking training phrases into the test set
+* Adversarial phrases were misaligned for words with several pronunciations or without similar words
+* `get_false_positives` counted a run of positive frames more than once (upstream PR #353)
+* Boolean command line flags of `train.py` defaulted to the string "False" (upstream PRs #351, #308)
+* Custom verifier models were applied repeatedly and with the features of the wrong model when several models were loaded
+* `mix_clips_batch` crashed with the default `start_index` and when converting to 16-bit PCM
+* `apply_reverb` used the first character of a single path; augmented clips could overflow 16-bit PCM
+* `detect_from_microphone.py` defaults to ONNX on Windows and downloads the models (upstream PR #237)
+
 ## v0.6.0 - 2023/06/15
 
 ### Added
